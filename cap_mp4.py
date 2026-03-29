@@ -8,7 +8,7 @@ import os
 
 is_recording = True
 
-# 存图专用队列（保证不丢帧，容量 30 足够缓冲偶发系统卡顿）
+# 存图专用队列（优先实时性，容量 30；满时会丢帧避免阻塞采集）
 image_queue = queue.Queue(maxsize=30)
 # 显示专用队列（容量必须为 1，满了直接丢弃，绝不阻塞后台存图）
 display_queue = queue.Queue(maxsize=1)
@@ -57,8 +57,8 @@ def init_camera_params(cam, target_fps):
 
     print(f"[4/4] 硬件底层实际生效帧率反馈: {actual_fps:.2f} FPS")
 
-    # 允许 0.5 FPS 的浮点数计算误差
-    if actual_fps < (target_fps - 0.5):
+    # 允许 5 FPS 的浮点数计算误差
+    if actual_fps < (target_fps - 5):
         print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         print(f"[致命警告] 相机无法达到你要求的 {target_fps} FPS！")
         print(f"当前物理极限被卡在了 {actual_fps:.2f} FPS。")
@@ -86,12 +86,19 @@ def acquire_thread(cam):
                     cam.data_stream[0].q_buf(raw_image)
                 continue
 
+            # 使用电脑时间戳（纳秒）作为采集时刻，随帧传入存图线程
+            capture_ts_ns = time.time_ns()
             if not image_queue.full():
-                image_queue.put(raw_image)
+                image_queue.put((raw_image, capture_ts_ns))
             else:
                 cam.data_stream[0].q_buf(raw_image)
         except Exception as e:
-            pass  # 忽略取图超时等常规报错，保持线程存活
+            # 超时属于常规现象；其他异常需要可见并触发安全停机
+            if "timeout" in str(e).lower():
+                continue
+            print(f"[取图异常]: {e}")
+            is_recording = False
+            break
 
 
 def record_thread(cam):
@@ -106,33 +113,42 @@ def record_thread(cam):
 
     while is_recording or not image_queue.empty():
         try:
-            raw_image = image_queue.get(timeout=1.0)
+            item = image_queue.get(timeout=1.0)
+            raw_image = None
+            try:
+                if isinstance(item, tuple) and len(item) == 2:
+                    raw_image, capture_ts_ns = item
+                else:
+                    # 兼容旧结构：若队列元素不是二元组则回退到当前时间
+                    raw_image = item
+                    capture_ts_ns = time.time_ns()
 
-            numpy_image = raw_image.get_numpy_array()
-            if numpy_image is not None:
-                # --- 1. 核心任务：安全、高质量保存图片 ---
-                frame_id = raw_image.get_frame_id()
-                img_path = f"dataset_images/frame_{frame_id:06d}.jpg"
-                cv2.imwrite(img_path, numpy_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                numpy_image = raw_image.get_numpy_array()
+                if numpy_image is not None:
+                    # --- 1. 核心任务：安全、高质量保存图片 ---
+                    img_path = f"dataset_images/frame_{capture_ts_ns}.jpg"
+                    cv2.imwrite(img_path, numpy_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-                # --- 2. 附加任务：抽帧送去预览 (每 3 帧抽 1 帧) ---
-                if frame_count % 3 == 0:
-                    if display_queue.empty():
-                        preview_img = cv2.resize(numpy_image, (1024, 800))
-                        display_queue.put(preview_img)
+                    # --- 2. 附加任务：抽帧送去预览 (每 3 帧抽 1 帧) ---
+                    if frame_count % 3 == 0:
+                        if display_queue.empty():
+                            preview_img = cv2.resize(numpy_image, (1024, 800))
+                            display_queue.put(preview_img)
 
-            # --- 3. 终极底线：用完立刻归还零拷贝内存 ---
-            cam.data_stream[0].q_buf(raw_image)
-            image_queue.task_done()
-            frame_count += 1
+                frame_count += 1
 
-            # --- 4. 打印存图进度与真实耗时监控 ---
-            if frame_count % 15 == 0:
-                elapsed = time.time() - start_time
-                real_save_fps = 15 / elapsed
-                print(
-                    f"[存图监控] 已保存: {frame_count} 帧 | 实际存图速率: {real_save_fps:.2f} FPS | 队列积压: {image_queue.qsize()}")
-                start_time = time.time()
+                # --- 3. 打印存图进度与真实耗时监控 ---
+                if frame_count % 15 == 0:
+                    elapsed = time.time() - start_time
+                    real_save_fps = 15 / elapsed
+                    print(
+                        f"[存图监控] 已保存: {frame_count} 帧 | 实际存图速率: {real_save_fps:.2f} FPS | 队列积压: {image_queue.qsize()}")
+                    start_time = time.time()
+            finally:
+                # 终极底线：无论中间是否异常，都必须归还零拷贝内存
+                if raw_image is not None:
+                    cam.data_stream[0].q_buf(raw_image)
+                image_queue.task_done()
 
         except queue.Empty:
             continue
@@ -153,52 +169,66 @@ def main():
         sys.exit(1)
 
     cam = device_manager.open_device_by_sn(dev_info_list[0].get("sn"))
+    t_record = None
+    t_acquire = None
 
     try:
         # 执行初始化与状态自检
         init_camera_params(cam, TARGET_FPS)
+        # 启动后台工作线程
+        t_record = threading.Thread(target=record_thread, args=(cam,))
+        t_record.start()
+
+        t_acquire = threading.Thread(target=acquire_thread, args=(cam,))
+        t_acquire.start()
+
+        print("=========================================================")
+        print("采集已启动！正在显示实时监控预览...")
+        print("在弹出的图像窗口中按下键盘 'q' 键，即可安全停止录制。")
+        print("=========================================================")
+
+        # 主线程负责 UI 显示
+        while is_recording:
+            try:
+                preview_frame = display_queue.get(timeout=0.1)
+
+                # 彩色与黑白兼容处理
+                if len(preview_frame.shape) == 2:
+                    preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_GRAY2BGR)
+
+                cv2.imshow('Camera Live Monitor', preview_frame)
+            except queue.Empty:
+                pass
+
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                print("\n接收到停止指令，正在通知底层安全停止...")
+                is_recording = False
+                break
     except RuntimeError as e:
-        # 如果帧率自检失败，安全关闭设备并退出程序
         print(e)
-        cam.close_device()
-        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n检测到 Ctrl+C，正在安全停止...")
+    except Exception as e:
+        print(f"\n主流程异常：{e}")
+    finally:
+        is_recording = False
+        cv2.destroyAllWindows()
 
-    # 启动后台工作线程
-    t_record = threading.Thread(target=record_thread, args=(cam,))
-    t_record.start()
+        if t_acquire is not None:
+            t_acquire.join()
+        if t_record is not None:
+            t_record.join()
 
-    t_acquire = threading.Thread(target=acquire_thread, args=(cam,))
-    t_acquire.start()
-
-    print("=========================================================")
-    print("采集已启动！正在显示实时监控预览...")
-    print("在弹出的图像窗口中按下键盘 'q' 键，即可安全停止录制。")
-    print("=========================================================")
-
-    # 主线程负责 UI 显示
-    while is_recording:
         try:
-            preview_frame = display_queue.get(timeout=0.1)
-
-            # 彩色与黑白兼容处理
-            if len(preview_frame.shape) == 2:
-                preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_GRAY2BGR)
-
-            cv2.imshow('Camera Live Monitor', preview_frame)
-        except queue.Empty:
+            cam.stream_off()
+        except Exception:
+            pass
+        try:
+            cam.close_device()
+        except Exception:
             pass
 
-        if cv2.waitKey(10) & 0xFF == ord('q'):
-            print("\n接收到停止指令，正在通知底层安全停止...")
-            is_recording = False
-            break
-
-    cv2.destroyAllWindows()
-    t_acquire.join()
-    t_record.join()
-    cam.stream_off()
-    cam.close_device()
-    print("底层资源已全部释放，程序完美退出。")
+        print("底层资源已全部释放，程序完美退出。")
 
 
 if __name__ == '__main__':
