@@ -105,8 +105,8 @@ def record_thread(cam):
     """存图线程：稳定保存 JPEG 序列，顺手提供预览帧"""
     global is_recording
 
-    if not os.path.exists('dataset_images'):
-        os.makedirs('dataset_images')
+    if not os.path.exists('./dataset_images'):
+        os.makedirs('./dataset_images')
 
     frame_count = 0
     start_time = time.time()
@@ -126,7 +126,7 @@ def record_thread(cam):
                 numpy_image = raw_image.get_numpy_array()
                 if numpy_image is not None:
                     # --- 1. 核心任务：安全、高质量保存图片 ---
-                    img_path = f"dataset_images/frame_{capture_ts_ns}.jpg"
+                    img_path = f"./dataset_images/frame_{capture_ts_ns}.jpg"
                     cv2.imwrite(img_path, numpy_image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
                     # --- 2. 附加任务：抽帧送去预览 (每 3 帧抽 1 帧) ---
