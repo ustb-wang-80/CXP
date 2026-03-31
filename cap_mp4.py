@@ -123,7 +123,18 @@ def record_thread(cam):
                     raw_image = item
                     capture_ts_ns = time.time_ns()
 
-                numpy_image = raw_image.get_numpy_array()
+                # 核心原因：彩色工业相机默认输出的是单通道的 Bayer 格式原始数据
+                # 需要将其转换为 RGB/BGR 三通道数据才能正常显示彩色
+                if raw_image.get_color_filter_id() != gx.GxColorFilterEntry.NONE:
+                    # 使用 gxipy 内置算法将 Bayer 转换为 RGB 彩色图像
+                    rgb_image = raw_image.convert("RGB8")
+                    numpy_image = rgb_image.get_numpy_array()
+                    # OpenCV 默认使用 BGR 通道顺序，需要转换一下
+                    if numpy_image is not None:
+                        numpy_image = cv2.cvtColor(numpy_image, cv2.COLOR_RGB2BGR)
+                else:
+                    # 如果是纯黑白相机，直接获取 2D 数组
+                    numpy_image = raw_image.get_numpy_array()
                 if numpy_image is not None:
                     # --- 1. 核心任务：安全、高质量保存图片 ---
                     img_path = f"./dataset_images/frame_{capture_ts_ns}.jpg"
