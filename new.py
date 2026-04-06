@@ -149,8 +149,7 @@ def save_process_worker(mp_queue, worker_id, bayer_cvt_code):
     专门负责耗时的色彩转换和 JPEG 压缩保存
     worker_id: 用于区分是哪个进程在干活
     """
-    if not os.path.exists('./dataset_images'):
-        os.makedirs('./dataset_images')
+    os.makedirs('./dataset_images', exist_ok=True)
 
     print(f"[保存工人 {worker_id} 号] 已启动，准备接单...")
     
@@ -193,6 +192,7 @@ def acquire_thread(cam, mp_queue, display_queue, is_recording_event):
     start_time = time.time()
 
     while is_recording_event.is_set():
+        raw_image = None
         try:
             raw_image = cam.data_stream[0].dq_buf(timeout=1000)
             # 坏帧不处理、缓冲必归还、流程不断流
@@ -228,13 +228,22 @@ def acquire_thread(cam, mp_queue, display_queue, is_recording_event):
             if frame_count % 15 == 0:
                 elapsed = time.time() - start_time
                 real_fps = 15 / elapsed
-                print(f"[主控台] 成功抓取: {frame_count} 帧 | 抓取速率: {real_fps:.2f} FPS | 待处理积压: {mp_queue.qsize()}")
+                try:
+                    queue_depth = mp_queue.qsize()
+                except (NotImplementedError, OSError):
+                    queue_depth = "N/A"
+                print(f"[主控台] 成功抓取: {frame_count} 帧 | 抓取速率: {real_fps:.2f} FPS | 待处理积压: {queue_depth}")
                 start_time = time.time()
 
             # 终极底线：立刻归还零拷贝内存
             cam.data_stream[0].q_buf(raw_image)
 
         except Exception as e:
+            if raw_image is not None:
+                try:
+                    cam.data_stream[0].q_buf(raw_image)
+                except Exception:
+                    pass
             if "timeout" in str(e).lower():
                 continue
             print(f"[取图异常]: {e}")
@@ -296,8 +305,11 @@ def main():
                 preview_bayer = display_queue.get(timeout=0.1)
                 
                 # 在主线程中将其转为彩色用于显示
-                preview_color = cv2.cvtColor(preview_bayer, bayer_cvt_code)
-                cv2.imshow('Camera Live Monitor', preview_color)
+                if bayer_cvt_code is not None:
+                    preview_color = cv2.cvtColor(preview_bayer, bayer_cvt_code)
+                    cv2.imshow('Camera Live Monitor', preview_color)
+                else:
+                    cv2.imshow('Camera Live Monitor', preview_bayer)
                 
             except queue.Empty:
                 pass
